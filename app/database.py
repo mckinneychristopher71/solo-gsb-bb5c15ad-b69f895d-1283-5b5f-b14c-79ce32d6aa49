@@ -1,4 +1,4 @@
-"""SQLite 持久层：启动时建库建表，提供审计记录的存取。"""
+"""SQLite 持久层：启动时建库建表，提供审计记录与复核标记的存取。"""
 
 from __future__ import annotations
 
@@ -46,6 +46,24 @@ CREATE TABLE IF NOT EXISTS conflicts (
 CREATE INDEX IF NOT EXISTS idx_conflicts_manifest ON conflicts(manifest_id);
 CREATE INDEX IF NOT EXISTS idx_conflicts_node ON conflicts(node);
 CREATE INDEX IF NOT EXISTS idx_manifests_created ON manifests(created_at);
+
+-- 跨审计复核标记：按冲突指纹（祖先+被依赖节点+双方规范化许可证）生效，
+-- 不绑定单次审计；撤销仅置状态，记录保留。
+CREATE TABLE IF NOT EXISTS review_marks (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint      TEXT NOT NULL,
+    ancestor         TEXT NOT NULL,
+    node             TEXT NOT NULL,
+    ancestor_license TEXT NOT NULL,
+    node_license     TEXT NOT NULL,
+    note             TEXT NOT NULL DEFAULT '',
+    expires_at       TEXT,
+    status           TEXT NOT NULL DEFAULT 'active',
+    created_at       TEXT NOT NULL,
+    revoked_at       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_marks_fingerprint ON review_marks(fingerprint);
 """
 
 
@@ -173,3 +191,110 @@ def delete_audit(manifest_id: int) -> bool:
         cur = conn.execute("DELETE FROM manifests WHERE id = ?", (manifest_id,))
         conn.commit()
         return cur.rowcount > 0
+
+
+# --- 跨审计复核标记 -----------------------------------------------------------
+
+
+def _review_mark_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "fingerprint": row["fingerprint"],
+        "ancestor": row["ancestor"],
+        "node": row["node"],
+        "ancestor_license": row["ancestor_license"],
+        "node_license": row["node_license"],
+        "note": row["note"],
+        "expires_at": row["expires_at"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "revoked_at": row["revoked_at"],
+    }
+
+
+def save_review_mark(
+    fingerprint: str,
+    ancestor: str,
+    node: str,
+    ancestor_license: str,
+    node_license: str,
+    note: str,
+    expires_at: Optional[str],
+) -> Dict[str, Any]:
+    """创建一条复核标记（按冲突指纹跨审计生效），返回完整记录。"""
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO review_marks
+                (fingerprint, ancestor, node, ancestor_license, node_license,
+                 note, expires_at, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
+            """,
+            (
+                fingerprint,
+                ancestor,
+                node,
+                ancestor_license,
+                node_license,
+                note,
+                expires_at,
+                created_at,
+            ),
+        )
+        conn.commit()
+        mark_id = int(cur.lastrowid)
+    mark = get_review_mark(mark_id)
+    assert mark is not None
+    return mark
+
+
+def get_review_mark(mark_id: int) -> Optional[Dict[str, Any]]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM review_marks WHERE id = ?", (mark_id,)
+        ).fetchone()
+    return _review_mark_dict(row) if row is not None else None
+
+
+def list_review_marks() -> List[Dict[str, Any]]:
+    """全部复核记录（含已过期/已撤销），最新在前。"""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM review_marks ORDER BY id DESC"
+        ).fetchall()
+    return [_review_mark_dict(r) for r in rows]
+
+
+def revoke_review_mark(mark_id: int) -> bool:
+    """撤销复核标记（记录保留，仅置状态）。已撤销/不存在时返回 False。"""
+    revoked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE review_marks SET status = 'revoked', revoked_at = ?"
+            " WHERE id = ? AND status = 'active'",
+            (revoked_at, mark_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def active_review_marks(now: Optional[datetime] = None) -> Dict[str, Dict[str, Any]]:
+    """指纹 -> 最新一条有效（未撤销且未过期）复核标记。
+
+    过期与已撤销的标记在此被过滤，对应条目因此自动回到「待复核」。
+    """
+    now = now or datetime.now(timezone.utc)
+    marks: Dict[str, Dict[str, Any]] = {}
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM review_marks WHERE status = 'active' ORDER BY id DESC"
+        ).fetchall()
+    for row in rows:
+        mark = _review_mark_dict(row)
+        expires_at = mark["expires_at"]
+        if expires_at and datetime.fromisoformat(expires_at) <= now:
+            continue  # 已过期
+        # 倒序遍历，同一指纹首条即最新有效标记
+        marks.setdefault(mark["fingerprint"], mark)
+    return marks

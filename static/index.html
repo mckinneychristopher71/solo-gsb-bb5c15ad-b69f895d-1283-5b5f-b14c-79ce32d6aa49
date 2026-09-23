@@ -59,6 +59,8 @@
   .badge.conflict { background: var(--err-bg); color: var(--err); }
   .badge.warning  { background: var(--warn-bg); color: var(--warn); }
   .badge.clean    { background: var(--ok-bg); color: var(--ok); }
+  .badge.reviewed { background: var(--ok-bg); color: var(--ok); }
+  .badge.pending  { background: var(--warn-bg); color: var(--warn); }
   .badge.cat-permissive { background: var(--ok-bg); color: var(--ok); }
   .badge.cat-weak-copyleft { background: #ecf7e6; color: #4a7d14; }
   .badge.cat-strong-copyleft { background: var(--err-bg); color: var(--err); }
@@ -106,12 +108,24 @@
   .fields-changed { font-size: 12px; color: var(--muted); margin: 4px 0; }
   .meta-line { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
   .node-lic-base, .node-lic-target { display: inline-block; }
+  .review-line {
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--line);
+    font-size: 12px;
+  }
+  .review-line input[type=text] { min-width: 200px; flex: 0 1 260px; padding: 6px 10px; font-size: 12px; }
+  .review-line input[type=datetime-local] {
+    border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px;
+    font-size: 12px; color: var(--ink); background: #fff;
+  }
+  button.small { padding: 5px 12px; font-size: 12px; }
+  .review-note { color: var(--ink); }
 </style>
 </head>
 <body>
 <header class="top">
   <h1>🛡️ 许可证依赖冲突审计台</h1>
-  <p>规范化依赖节点 · 按许可证兼容矩阵计算传递约束 · 标出冲突的最短依赖路径 · 支持按包筛选与 JSON 导出
+  <p>规范化依赖节点 · 按许可证兼容矩阵计算传递约束 · 标出冲突的最短依赖路径 · 跨审计复核标记 · 支持按包筛选与 JSON 导出
     <a href="/docs" target="_blank">API 文档</a><a href="/api/matrix" target="_blank">兼容矩阵</a>
   </p>
 </header>
@@ -149,6 +163,19 @@
     <div id="compare-result" class="hidden-block" style="margin-top:18px;"></div>
   </section>
 
+  <section class="card">
+    <div class="row" style="justify-content:space-between;">
+      <h2 style="margin:0;">复核记录（跨审计生效）</h2>
+      <button class="secondary small" id="btn-refresh-reviews">刷新</button>
+    </div>
+    <div class="hint" style="margin-top:8px;">
+      复核标记按指纹（祖先节点 + 被依赖节点 + 双方规范化许可证）跨审计生效：在下方审计结果的冲突卡片上
+      填写备注、选择失效时间后点击「标记已复核」即可创建。许可证变化、标记过期或被撤销后，
+      对应条目自动回到「待复核」。
+    </div>
+    <div id="review-marks" style="margin-top:12px;"></div>
+  </section>
+
   <section id="result" class="hidden-block">
     <div class="card">
       <div class="row" style="justify-content:space-between;">
@@ -161,6 +188,7 @@
         <div class="stat"><div class="num" id="s-conf" style="color:var(--err)">0</div><div class="label">硬冲突</div></div>
         <div class="stat"><div class="num" id="s-warn" style="color:var(--warn)">0</div><div class="label">许可证告警</div></div>
         <div class="stat"><div class="num" id="s-unres" style="color:var(--muted)">0</div><div class="label">未解析依赖</div></div>
+        <div class="stat"><div class="num" id="s-review" style="color:var(--warn)">0</div><div class="label">待复核</div></div>
       </div>
       <div class="row" style="margin-top:16px;">
         <input type="text" id="filter" placeholder="按包名筛选，如 pdf-export 或 gpl（匹配冲突路径上的任意节点）">
@@ -249,6 +277,7 @@ function render(result) {
   $("s-conf").textContent = s.conflicts;
   $("s-warn").textContent = s.license_warnings;
   $("s-unres").textContent = s.unresolved;
+  $("s-review").textContent = (s.review && typeof s.review.pending === "number") ? s.review.pending : s.conflicts + s.license_warnings;
   const statusEl = $("r-status");
   if (result.status === "conflict") {
     statusEl.innerHTML = '<span class="badge conflict">发现硬冲突</span>';
@@ -261,6 +290,32 @@ function render(result) {
   renderNodes(result);
   renderWarnings(result);
   $("filter-note").textContent = "";
+}
+
+function fmtTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? String(iso) : d.toLocaleString();
+}
+
+function renderReviewBlock(c) {
+  const r = c.review || { state: "pending" };
+  if (r.state === "reviewed") {
+    return '<div class="review-line">' +
+      '<span class="badge reviewed">已复核</span>' +
+      (r.note ? '<span class="review-note">备注：' + esc(r.note) + "</span>" : '<span class="muted">（无备注）</span>') +
+      '<span class="muted">标记于 ' + esc(fmtTime(r.marked_at)) + "</span>" +
+      '<span class="muted">失效：' + (r.expires_at ? esc(fmtTime(r.expires_at)) : "永久有效") + "</span>" +
+      '<button class="secondary small" data-action="revoke" data-mid="' + r.mark_id + '">撤销标记</button>' +
+      "</div>";
+  }
+  return '<div class="review-line">' +
+    '<span class="badge pending">待复核</span>' +
+    '<input type="text" id="rv-note-' + c.id + '" placeholder="复核备注（可选）">' +
+    '<input type="datetime-local" id="rv-exp-' + c.id + '" title="失效时间（留空则永久有效）">' +
+    '<button class="secondary small" data-action="mark" data-cid="' + c.id + '">标记已复核</button>' +
+    '<span class="hint">留空失效时间表示永久有效</span>' +
+    "</div>";
 }
 
 function renderConflicts(result) {
@@ -278,6 +333,7 @@ function renderConflicts(result) {
       </div>
       <div class="reason">${esc(c.reason)}</div>
       <div class="path">${renderPath(c.path)}</div>
+      ${renderReviewBlock(c)}
     </div>`).join("");
 }
 
@@ -339,7 +395,7 @@ $("btn-audit").addEventListener("click", async () => {
   $("btn-audit").disabled = true;
   const result = await doAudit(manifest, manifest.name);
   $("btn-audit").disabled = false;
-  if (result) { currentFilter = ""; $("filter").value = ""; render(result); loadAuditList(); }
+  if (result) { currentFilter = ""; $("filter").value = ""; render(result); loadAuditList(); loadReviewMarks(); }
 });
 
 $("file").addEventListener("change", () => {
@@ -362,6 +418,115 @@ $("btn-clear").addEventListener("click", () => {
   $("filter").value = ""; currentFilter = "";
   if (currentResult) { render(currentResult); }
 });
+
+// --- 跨审计复核标记 -----------------------------------------------------------
+
+async function refreshCurrentAudit() {
+  if (!currentResult) return;
+  const pkg = $("filter").value.trim();
+  const url = "/api/audits/" + currentResult.audit_id + (pkg ? "?package=" + encodeURIComponent(pkg) : "");
+  const resp = await fetch(url);
+  const data = await resp.json();
+  if (!resp.ok) return;
+  if (!pkg) currentResult = data;
+  renderConflicts(data);
+  renderNodes(data);
+  renderWarnings(data);
+  if (data.summary && data.summary.review) $("s-review").textContent = data.summary.review.pending;
+}
+
+$("conflicts").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-action]");
+  if (!btn || !currentResult) return;
+  btn.disabled = true;
+  try {
+    if (btn.dataset.action === "mark") {
+      const cid = btn.dataset.cid;
+      const noteEl = $("rv-note-" + cid);
+      const expEl = $("rv-exp-" + cid);
+      const body = {
+        audit_id: currentResult.audit_id,
+        conflict_id: cid,
+        note: (noteEl && noteEl.value.trim()) || null,
+      };
+      if (expEl && expEl.value) body.expires_at = new Date(expEl.value).toISOString();
+      const resp = await fetch("/api/reviews", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json();
+      if (!resp.ok) { showAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)); return; }
+    } else if (btn.dataset.action === "revoke") {
+      const resp = await fetch("/api/reviews/" + btn.dataset.mid + "/revoke", { method: "POST" });
+      const data = await resp.json();
+      if (!resp.ok) { showAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)); return; }
+    } else {
+      return;
+    }
+    clearAlert();
+    await refreshCurrentAudit();
+    loadReviewMarks();
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+const MARK_STATE_UI = {
+  active: '<span class="badge reviewed">有效</span>',
+  expired: '<span class="badge pending">已过期</span>',
+  revoked: '<span class="badge conflict">已撤销</span>',
+};
+
+async function loadReviewMarks() {
+  let items = [];
+  try {
+    const resp = await fetch("/api/reviews");
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "加载复核记录失败");
+    items = data.items || [];
+  } catch (e) {
+    $("review-marks").innerHTML = '<p class="muted">' + esc(e.message) + "</p>";
+    return;
+  }
+  const box = $("review-marks");
+  if (!items.length) {
+    box.innerHTML = '<p class="muted">暂无复核标记。执行审计后，在冲突卡片上填写备注并点击「标记已复核」即可创建。</p>';
+    return;
+  }
+  box.innerHTML = '<div style="overflow-x:auto;"><table><thead><tr>' +
+    "<th>冲突对象（祖先 → 被依赖）</th><th>规范化许可证对</th><th>备注</th><th>失效时间</th><th>状态</th><th>创建时间</th><th>操作</th>" +
+    "</tr></thead><tbody>" +
+    items.map((m) => "<tr>" +
+      "<td class='mono'>" + esc(m.ancestor) + " → " + esc(m.node) + "</td>" +
+      "<td class='mono'>" + esc(m.ancestor_license) + " → " + esc(m.node_license) + "</td>" +
+      "<td>" + (m.note ? esc(m.note) : '<span class="muted">—</span>') + "</td>" +
+      "<td class='mono'>" + (m.expires_at ? esc(fmtTime(m.expires_at)) : "永久有效") + "</td>" +
+      "<td>" + (MARK_STATE_UI[m.effective_state] || esc(m.effective_state)) + "</td>" +
+      "<td class='mono'>" + esc(fmtTime(m.created_at)) + "</td>" +
+      "<td>" + (m.effective_state === "active"
+        ? '<button class="secondary small" data-action="revoke-mark" data-mid="' + m.id + '">撤销</button>'
+        : "") + "</td>" +
+    "</tr>").join("") + "</tbody></table></div>";
+}
+
+$("review-marks").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-action=revoke-mark]");
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/reviews/" + btn.dataset.mid + "/revoke", { method: "POST" });
+    const data = await resp.json();
+    if (!resp.ok) { showAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)); return; }
+    clearAlert();
+    await refreshCurrentAudit();
+    loadReviewMarks();
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("btn-refresh-reviews").addEventListener("click", loadReviewMarks);
 
 $("btn-export").addEventListener("click", () => {
   if (!currentResult) return;
@@ -555,6 +720,8 @@ $("btn-refresh-audits").addEventListener("click", loadAuditList);
 $("btn-sample").click();
 // 页面加载即拉取历史审计，便于立即选择对比
 loadAuditList();
+// 页面加载即拉取复核记录
+loadReviewMarks();
 </script>
 </body>
 </html>

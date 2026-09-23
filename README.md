@@ -15,6 +15,11 @@ manifest，系统会：
    按「祖先节点 → 被依赖节点」配对冲突/告警，展示新增、消失及状态变化（严重程度/
    许可证/最短路径），每条都附上双方各自的最短依赖路径；对比为纯只读操作，
    记录不存在时返回明确错误（404），**不会写入新审计**。
+7. **跨审计复核标记** —— 对冲突/告警的 *祖先节点 + 被依赖节点 + 双方规范化许可证*
+   计算指纹，在网页上填写复核备注与失效时间即可标记「已复核」，也可随时撤销；
+   记录持久化在 SQLite。读取 **任意历史审计** 时，仅把指纹一致、未过期且未撤销的
+   最新标记附到对应条目，区分 **待复核 / 已复核**；许可证变更（指纹改变）、标记过期
+   或被撤销后，条目自动回到「待复核」。原始冲突、严重程度与两次审计对比完全不受影响。
 
 ## 快速开始（Docker Compose，一键启动，推荐）
 
@@ -101,6 +106,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/audits/{id}?download=true&package=xxx` | 导出（筛选后的）JSON 文件 |
 | GET | `/api/audits/compare/{base_id}/{target_id}` | **两次审计对比**（只读，不写入） |
 | DELETE | `/api/audits/{id}` | 删除审计记录 |
+| POST | `/api/reviews` | **创建跨审计复核标记**（按冲突指纹生效） |
+| GET | `/api/reviews` | 复核标记记录列表（含已过期/已撤销） |
+| POST | `/api/reviews/{id}/revoke` | 撤销复核标记（记录保留） |
 | GET | `/api/matrix` | 许可证兼容矩阵 |
 | GET | `/api/sample` | 内置示例 manifest |
 
@@ -149,6 +157,49 @@ HTTP/1.1 400 Bad Request
 结果按新增 / 消失 / 变化分组，变化项会用 `硬冲突 → 告警` 这类徽标展示严重程度翻转，
 并同时渲染双方的最短依赖路径（红色=基准，绿色=目标），折叠区可查看全部节点配对明细。
 
+### 跨审计复核标记接口
+
+复核标记绑定的是 **冲突指纹**（祖先节点 + 被依赖节点 + 双方规范化许可证的 SHA-256），
+而不是某一次审计，因此同一份 manifest 反复审计时标记始终跟随；`Apache 2.0` 与
+`Apache-2.0` 这类写法差异也会归一到同一指纹。
+
+```bash
+# 1) 先审计，拿到冲突条目 id（如 C001）
+AUDIT_ID=$(curl -s -F "file=@static/examples/sample-manifest.json" \
+  http://localhost:8000/api/audit/upload | python3 -c "import sys,json;print(json.load(sys.stdin)['audit_id'])")
+
+# 2) 创建复核标记：备注 + 失效时间（expires_at 可省略，表示永久有效）
+curl -X POST http://localhost:8000/api/reviews \
+  -H "Content-Type: application/json" \
+  -d "{\"audit_id\": $AUDIT_ID, \"conflict_id\": \"C001\",
+       \"note\": \"法务已确认组合分发\", \"expires_at\": \"2026-12-31T23:59:59Z\"}"
+
+# 3) 读取任意历史审计：指纹一致且未过期/未撤销的最新标记会附到对应条目
+curl http://localhost:8000/api/audits/$AUDIT_ID
+#   conflicts[0].review = {"state": "reviewed", "mark_id": 1, "note": "...", ...}
+#   未命中标记的条目则为 {"state": "pending"}；summary.review 给出待复核/已复核统计
+
+# 4) 查看全部复核记录（effective_state: active / expired / revoked）
+curl http://localhost:8000/api/reviews
+
+# 5) 撤销标记（记录保留，条目立即回到待复核）
+curl -X POST http://localhost:8000/api/reviews/1/revoke
+```
+
+行为约定：
+
+- 标记只在 **读取层** 附着，数据库中的审计结果保持原始形态，
+  两次审计对比（`/api/audits/compare/...`）不受复核标记影响；
+- 许可证发生变化 → 指纹改变 → 旧标记不再附着，条目自动回到「待复核」；
+- 标记过期（到达 `expires_at`）或被撤销 → 同样自动回到「待复核」，无需任何手动清理；
+- 同一指纹可存在多条记录，**最新一条有效（未撤销且未过期）标记** 生效；
+- `expires_at` 使用 ISO 8601（可带 `Z` 或时区偏移，不带时区按 UTC 处理），格式非法返回 `422`；
+  `audit_id` / `conflict_id` 不存在返回 `404`，重复撤销返回 `404`。
+
+网页端在审计结果的每张冲突卡片上即可操作：待复核时填写备注、选择失效时间
+（留空为永久有效）后点击「标记已复核」；已复核时展示备注与失效时间，可一键撤销。
+「复核记录」卡片汇总全部标记（有效 / 已过期 / 已撤销）并支持撤销。
+
 ## 审计结果结构（节选）
 
 ```json
@@ -156,7 +207,8 @@ HTTP/1.1 400 Bad Request
   "audit_id": 1,
   "manifest_name": "billing-platform-demo",
   "status": "conflict",
-  "summary": { "packages": 13, "edges": 15, "conflicts": 4, "license_warnings": 3, "unresolved": 1 },
+  "summary": { "packages": 13, "edges": 15, "conflicts": 4, "license_warnings": 3, "unresolved": 1,
+               "review": { "total": 7, "reviewed": 2, "pending": 5 } },
   "nodes": [
     { "id": "pdf-export@4.0.0", "name": "pdf-export", "version": "4.0.0",
       "license_display": "Apache 2.0", "license": "Apache-2.0",
@@ -170,7 +222,10 @@ HTTP/1.1 400 Bad Request
       "ancestor_license": "GPL-2.0", "node_license": "Apache 2.0",
       "distance": 1,
       "path": ["billing-core@1.2.0", "pdf-export@4.0.0"],
-      "reason": "GPL-2.0 与 Apache-2.0 专利条款冲突，不能组合进同一作品。"
+      "reason": "GPL-2.0 与 Apache-2.0 专利条款冲突，不能组合进同一作品。",
+      "review": { "state": "reviewed", "mark_id": 1,
+                  "note": "法务已确认组合分发", "expires_at": "2026-12-31T23:59:59+00:00",
+                  "marked_at": "2026-09-23T08:30:00+00:00" }
     }
   ],
   "unresolved": [ { "source": "web-app@2.1.0", "reference": "cache-redis", "reason": "依赖包未在 packages 中声明" } ],
@@ -202,14 +257,16 @@ HTTP/1.1 400 Bad Request
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由（JSON API + 网页，含两次审计对比接口）
+│   ├── main.py        # FastAPI 路由（JSON API + 网页，含两次审计对比与复核标记接口）
 │   ├── analyzer.py    # manifest 解析、节点规范化、传递约束、最短路径
 │   ├── compare.py     # 两次审计对比：节点/冲突配对与变化检测（纯只读）
+│   ├── review.py      # 跨审计复核标记：冲突指纹、失效时间解析、标记附着
 │   ├── licenses.py    # 许可证别名规范化与兼容矩阵
-│   └── database.py    # SQLite 初始化与审计记录持久化
+│   └── database.py    # SQLite 初始化与审计记录/复核标记持久化
 ├── static/
 │   ├── index.html     # 单文件网页（无外部 CDN 依赖）
 │   └── examples/sample-manifest.json
+├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_review
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
